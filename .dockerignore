@@ -1,0 +1,6 @@
+.env
+.env-production
+.git
+tmp/
+.air.toml
+README.md
