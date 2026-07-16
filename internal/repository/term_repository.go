@@ -2,6 +2,9 @@ package repository
 
 import (
 	"choice-matrix-backend/internal/models"
+	"choice-matrix-backend/internal/utils"
+	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -31,11 +34,11 @@ func (r *TermRepository) ListByProject(projectID uint) ([]models.Term, error) {
 
 // ProjectStats holds summary data for the dashboard
 type ProjectStats struct {
-	Total     int64            `json:"total"`
-	Draft     int64            `json:"draft"`
-	Pending   int64            `json:"pending"`
-	Review    int64            `json:"review"`
-	Published int64            `json:"published"`
+	Total     int64 `json:"total"`
+	Draft     int64 `json:"draft"`
+	Pending   int64 `json:"pending"`
+	Review    int64 `json:"review"`
+	Published int64 `json:"published"`
 	// LangCoverage: map[langCode] -> translated count
 	LangCoverage map[string]int64 `json:"lang_coverage"`
 }
@@ -116,14 +119,13 @@ type DashboardFocus struct {
 }
 
 type ProjectDashboard struct {
-	Stats           *ProjectStats               `json:"stats"`
-	Languages       []DashboardLanguageCoverage `json:"languages"`
-	RecentLogs      []models.HistoryLog         `json:"recent_logs"`
-	ActivityTrend   []DashboardTrendPoint       `json:"activity_trend"`
-	Focus           DashboardFocus              `json:"focus"`
-	LastActivityAt  *time.Time                  `json:"last_activity_at"`
+	Stats          *ProjectStats               `json:"stats"`
+	Languages      []DashboardLanguageCoverage `json:"languages"`
+	RecentLogs     []models.HistoryLog         `json:"recent_logs"`
+	ActivityTrend  []DashboardTrendPoint       `json:"activity_trend"`
+	Focus          DashboardFocus              `json:"focus"`
+	LastActivityAt *time.Time                  `json:"last_activity_at"`
 }
-
 
 // FindByID gets a single term by its ID (not including historical logs)
 func (r *TermRepository) FindByID(id uint) (*models.Term, error) {
@@ -271,7 +273,7 @@ func (r *TermRepository) updateInTx(tx *gorm.DB, term *models.Term, translations
 	if err := tx.Where("term_id = ?", term.ID).Find(&existing).Error; err != nil {
 		return err
 	}
-	
+
 	existingMap := make(map[string]string)
 	for _, t := range existing {
 		existingMap[t.LanguageCode] = t.Content
@@ -390,9 +392,109 @@ func (r *TermRepository) BatchUpdate(projectID uint, updateData []BatchUpdateTer
 	return count, err
 }
 
+type placeholderValidationIssue struct {
+	TermKey      string
+	LanguageCode string
+	Missing      []string
+	Extra        []string
+}
+
+func (r *TermRepository) validatePublishPlaceholders(tx *gorm.DB, termIDs []uint) error {
+	if len(termIDs) == 0 {
+		return nil
+	}
+
+	var terms []models.Term
+	if err := tx.Preload("Translations").Where("id IN ?", termIDs).Find(&terms).Error; err != nil {
+		return err
+	}
+
+	var issues []placeholderValidationIssue
+	for _, term := range terms {
+		var projectLangs []models.Language
+		if err := tx.Where("project_id = ?", term.ProjectID).Find(&projectLangs).Error; err != nil {
+			return err
+		}
+
+		translations := make(map[string]string, len(term.Translations))
+		for _, tr := range term.Translations {
+			translations[tr.LanguageCode] = tr.Content
+		}
+
+		source := pickPlaceholderSource(term, projectLangs, translations)
+		if len(utils.ExtractPlaceholders(source)) == 0 {
+			continue
+		}
+
+		for _, lang := range projectLangs {
+			missing, extra := utils.DiffPlaceholders(source, translations[lang.Code])
+			if len(missing) > 0 || len(extra) > 0 {
+				issues = append(issues, placeholderValidationIssue{
+					TermKey:      term.Key,
+					LanguageCode: lang.Code,
+					Missing:      missing,
+					Extra:        extra,
+				})
+			}
+		}
+	}
+
+	if len(issues) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("占位符不一致，无法发布: %s", formatPlaceholderIssues(issues))
+}
+
+func pickPlaceholderSource(term models.Term, projectLangs []models.Language, translations map[string]string) string {
+	for _, lang := range projectLangs {
+		if lang.IsSource && strings.TrimSpace(translations[lang.Code]) != "" {
+			return translations[lang.Code]
+		}
+	}
+
+	for _, code := range []string{"cn", "zh", "zh-CN", "en"} {
+		if strings.TrimSpace(translations[code]) != "" {
+			return translations[code]
+		}
+	}
+
+	for _, tr := range term.Translations {
+		if strings.TrimSpace(tr.Content) != "" {
+			return tr.Content
+		}
+	}
+
+	return term.Description
+}
+
+func formatPlaceholderIssues(issues []placeholderValidationIssue) string {
+	parts := make([]string, 0, len(issues))
+	for i, issue := range issues {
+		if i >= 3 {
+			parts = append(parts, "更多词条请回到工作台查看")
+			break
+		}
+
+		details := make([]string, 0, 2)
+		if len(issue.Missing) > 0 {
+			details = append(details, "缺少 "+strings.Join(issue.Missing, ", "))
+		}
+		if len(issue.Extra) > 0 {
+			details = append(details, "多出 "+strings.Join(issue.Extra, ", "))
+		}
+		parts = append(parts, fmt.Sprintf("%s/%s %s", issue.TermKey, issue.LanguageCode, strings.Join(details, "，")))
+	}
+	return strings.Join(parts, "；")
+}
+
 // Publish sets a term's status to published (manual step)
 func (r *TermRepository) Publish(termID uint, userID uint) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := r.validatePublishPlaceholders(tx, []uint{termID}); err != nil {
+			return err
+		}
+
 		if err := tx.Model(&models.Term{}).Where("id = ?", termID).
 			Update("status", models.TermStatusPublished).Error; err != nil {
 			return err
@@ -412,12 +514,16 @@ func (r *TermRepository) BatchPublish(termIDs []uint, userID uint) error {
 		return nil
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := r.validatePublishPlaceholders(tx, termIDs); err != nil {
+			return err
+		}
+
 		// Update status
 		if err := tx.Model(&models.Term{}).Where("id IN ?", termIDs).
 			Update("status", models.TermStatusPublished).Error; err != nil {
 			return err
 		}
-		
+
 		// Insert logs for each term
 		var logs []models.HistoryLog
 		for _, termID := range termIDs {
@@ -463,22 +569,44 @@ func (r *TermRepository) BatchDelete(termIDs []uint) error {
 // ImportJSON bulk-upserts terms and translations from a JSON flat map.
 // It returns the count of newly created terms and updated translations.
 func (r *TermRepository) ImportJSON(projectID uint, langCode string, data map[string]string) (created, updated int, err error) {
+	items := make([]ImportJSONItem, 0, len(data))
+	for key, content := range data {
+		items = append(items, ImportJSONItem{
+			Key:     key,
+			Content: content,
+		})
+	}
+	return r.ImportJSONItems(projectID, langCode, items)
+}
+
+type ImportJSONItem struct {
+	Module  string `json:"module"`
+	Key     string `json:"key"`
+	Content string `json:"content"`
+}
+
+// ImportJSONItems bulk-upserts terms and translations from normalized JSON import rows.
+// It supports both flat keys and object imports with module information.
+func (r *TermRepository) ImportJSONItems(projectID uint, langCode string, items []ImportJSONItem) (created, updated int, err error) {
 	err = r.db.Transaction(func(tx *gorm.DB) error {
-		for key, content := range data {
+		for _, item := range items {
+			key := strings.TrimSpace(item.Key)
+			module := strings.TrimSpace(item.Module)
+			content := item.Content
 			if key == "" || content == "" {
 				continue
 			}
 
 			// 1. Find or create the Term
 			var term models.Term
-			result := tx.Where("project_id = ? AND key = ?", projectID, key).First(&term)
+			result := tx.Where("project_id = ? AND module = ? AND key = ?", projectID, module, key).First(&term)
 
 			if result.Error != nil {
 				// Term doesn't exist — create it
 				term = models.Term{
 					ProjectID: projectID,
 					Key:       key,
-					Module:    "",
+					Module:    module,
 					Status:    models.TermStatusPending,
 				}
 				if err := tx.Create(&term).Error; err != nil {

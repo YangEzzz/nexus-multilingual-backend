@@ -22,9 +22,10 @@ func NewAuthHandler(userRepo *repository.UserRepository) *AuthHandler {
 	return &AuthHandler{userRepo: userRepo}
 }
 
-// LoginRequest requests username, password and project mapping ID
+// LoginRequest requests email, password and project mapping ID.
 type LoginRequest struct {
-	Username        string `json:"username" binding:"required"`
+	Email           string `json:"email"`
+	Username        string `json:"username"`
 	Password        string `json:"password" binding:"required"`
 	ProjectIDString string `json:"project_id_string" binding:"required"`
 }
@@ -35,15 +36,35 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "无效的请求参数: " + err.Error()})
 		return
 	}
+	if req.Email == "" {
+		req.Email = req.Username
+	}
+	if req.Email == "" {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "邮箱不能为空"})
+		return
+	}
 
 	// 1. 调用外部管理系统 API
-	requestBody, _ := json.Marshal(req)
-	resp, err := http.Post("http://localhost:3456/api/external/login", "application/json", bytes.NewBuffer(requestBody))
+	loginURL := "https://helios-api.team-tool.top/api/login"
+	requestBody, _ := json.Marshal(gin.H{
+		"email":             req.Email,
+		"password":          req.Password,
+		"project_id_string": req.ProjectIDString,
+	})
+	resp, err := http.Post(loginURL, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
+		fmt.Printf("Management System Login Error [%s]: %v\n", loginURL, err)
 		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "无法连接到认证服务器: " + err.Error()})
 		return
 	}
 	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取响应失败"})
+		return
+	}
+	fmt.Printf("Management System Login Response [%s] status=%d body=%s\n", loginURL, resp.StatusCode, string(bodyBytes))
 
 	if resp.StatusCode != http.StatusOK {
 		c.JSON(http.StatusOK, gin.H{"code": 401, "message": "认证失败或该用户不是项目成员"})
@@ -51,13 +72,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	// 2. 解析外部系统返回的结果
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取响应失败"})
-		return
-	}
-	fmt.Printf("Management System Response: %s\n", string(bodyBytes))
-
 	var extResp struct {
 		Code int `json:"code"`
 		Data struct {
@@ -115,7 +129,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"code": 200,
+		"code":    200,
 		"message": "登录成功",
 		"data": gin.H{
 			"token": token,
@@ -145,7 +159,7 @@ func (h *AuthHandler) GetCurrentUser(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"code": 200,
+		"code":    200,
 		"message": "获取成功",
 		"data": gin.H{
 			"id":          user.ID,

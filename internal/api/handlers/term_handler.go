@@ -275,15 +275,24 @@ func (h *TermHandler) ImportJSON(c *gin.Context) {
 	}
 
 	var req struct {
-		LanguageCode string            `json:"language_code" binding:"required"`
-		Data         map[string]string `json:"data" binding:"required"`
+		LanguageCode string                      `json:"language_code" binding:"required"`
+		Data         map[string]string           `json:"data"`
+		Items        []repository.ImportJSONItem `json:"items"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误: " + err.Error()})
 		return
 	}
 
-	created, updated, err := h.repo.ImportJSON(uint(projectID), req.LanguageCode, req.Data)
+	var created, updated int
+	if len(req.Items) > 0 {
+		created, updated, err = h.repo.ImportJSONItems(uint(projectID), req.LanguageCode, req.Items)
+	} else if len(req.Data) > 0 {
+		created, updated, err = h.repo.ImportJSON(uint(projectID), req.LanguageCode, req.Data)
+	} else {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "导入内容不能为空"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "导入失败: " + err.Error()})
 		return
@@ -317,5 +326,3 @@ func (h *TermHandler) GetProjectLogs(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "success", "data": logs})
 }
-
-
