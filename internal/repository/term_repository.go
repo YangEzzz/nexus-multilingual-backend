@@ -4,6 +4,7 @@ import (
 	"choice-matrix-backend/internal/models"
 	"choice-matrix-backend/internal/utils"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -121,10 +122,24 @@ type DashboardFocus struct {
 type ProjectDashboard struct {
 	Stats          *ProjectStats               `json:"stats"`
 	Languages      []DashboardLanguageCoverage `json:"languages"`
-	RecentLogs     []models.HistoryLog         `json:"recent_logs"`
+	RecentLogs     []ProjectActivityLog        `json:"recent_logs"`
 	ActivityTrend  []DashboardTrendPoint       `json:"activity_trend"`
 	Focus          DashboardFocus              `json:"focus"`
 	LastActivityAt *time.Time                  `json:"last_activity_at"`
+}
+
+// ProjectActivityLog is the shared response shape for term-level and project-level events.
+type ProjectActivityLog struct {
+	ID        string       `json:"id"`
+	Scope     string       `json:"scope"`
+	TermID    *uint        `json:"term_id,omitempty"`
+	UserID    uint         `json:"user_id"`
+	Action    string       `json:"action"`
+	ItemCount int          `json:"item_count,omitempty"`
+	TermKeys  []string     `json:"term_keys,omitempty"`
+	CreatedAt time.Time    `json:"created_at"`
+	Term      *models.Term `json:"term,omitempty"`
+	User      models.User  `json:"user,omitempty"`
 }
 
 // FindByID gets a single term by its ID (not including historical logs)
@@ -198,13 +213,20 @@ func (r *TermRepository) Dashboard(projectID uint, recentLimit int) (*ProjectDas
 	}
 
 	now := time.Now()
-	var recentChanges24h int64
+	var termChanges24h int64
 	if err := r.db.Model(&models.HistoryLog{}).
 		Joins("JOIN terms ON terms.id = history_logs.term_id").
 		Where("terms.project_id = ? AND history_logs.created_at >= ?", projectID, now.Add(-24*time.Hour)).
-		Count(&recentChanges24h).Error; err != nil {
+		Count(&termChanges24h).Error; err != nil {
 		return nil, err
 	}
+	var projectChanges24h int64
+	if err := r.db.Model(&models.ProjectHistoryLog{}).
+		Where("project_id = ? AND created_at >= ?", projectID, now.Add(-24*time.Hour)).
+		Count(&projectChanges24h).Error; err != nil {
+		return nil, err
+	}
+	recentChanges24h := termChanges24h + projectChanges24h
 
 	var staleTerms int64
 	if err := r.db.Model(&models.Term{}).
@@ -236,10 +258,22 @@ func (r *TermRepository) Dashboard(projectID uint, recentLimit int) (*ProjectDas
 		Scan(&trendRows).Error; err != nil {
 		return nil, err
 	}
+	var projectTrendRows []trendRow
+	if err := r.db.Model(&models.ProjectHistoryLog{}).
+		Select("TO_CHAR(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') as date, count(*) as count").
+		Where("project_id = ? AND created_at >= ?", projectID, now.AddDate(0, 0, -6)).
+		Group("date").
+		Order("date asc").
+		Scan(&projectTrendRows).Error; err != nil {
+		return nil, err
+	}
 
-	trendMap := make(map[string]int64, len(trendRows))
+	trendMap := make(map[string]int64, len(trendRows)+len(projectTrendRows))
 	for _, row := range trendRows {
-		trendMap[row.Date] = row.Count
+		trendMap[row.Date] += row.Count
+	}
+	for _, row := range projectTrendRows {
+		trendMap[row.Date] += row.Count
 	}
 
 	for i := 6; i >= 0; i-- {
@@ -368,6 +402,101 @@ type BatchUpdateTerm struct {
 	Description  string
 	Status       models.TermStatus
 	Translations map[string]string
+}
+
+// BatchCreateTerm is one row in a batch-create request. ClientID is echoed back
+// so the frontend can match persisted rows with its preview rows.
+type BatchCreateTerm struct {
+	ClientID     string            `json:"clientId"`
+	Module       string            `json:"module"`
+	Key          string            `json:"key"`
+	Description  string            `json:"description"`
+	Translations map[string]string `json:"translations"`
+}
+
+type BatchCreatedTerm struct {
+	ClientID string      `json:"clientId"`
+	Term     models.Term `json:"term"`
+}
+
+func batchCreateStatus(projectLangs []models.Language, filledLanguages map[string]bool) models.TermStatus {
+	if len(filledLanguages) == 0 {
+		return models.TermStatusDraft
+	}
+
+	for _, lang := range projectLangs {
+		if !filledLanguages[lang.Code] {
+			return models.TermStatusPending
+		}
+	}
+	if len(projectLangs) > 0 {
+		return models.TermStatusReview
+	}
+	return models.TermStatusPending
+}
+
+// BatchCreate creates a group of terms atomically. Status is derived on the
+// server from project-language coverage so single and batch callers cannot
+// publish content by supplying a status value.
+func (r *TermRepository) BatchCreate(projectID uint, createData []BatchCreateTerm, userID uint) ([]BatchCreatedTerm, error) {
+	created := make([]BatchCreatedTerm, 0, len(createData))
+	termKeys := make([]string, 0, len(createData))
+
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var projectLangs []models.Language
+		if err := tx.Where("project_id = ?", projectID).Find(&projectLangs).Error; err != nil {
+			return err
+		}
+
+		allowedLanguages := make(map[string]bool, len(projectLangs))
+		for _, lang := range projectLangs {
+			allowedLanguages[lang.Code] = true
+		}
+
+		for _, data := range createData {
+			translations := make([]models.Translation, 0, len(data.Translations))
+			filledLanguages := make(map[string]bool, len(data.Translations))
+			for langCode, content := range data.Translations {
+				if !allowedLanguages[langCode] {
+					return fmt.Errorf("语言 %s 未配置在当前项目中", langCode)
+				}
+				content = strings.TrimSpace(content)
+				if content == "" {
+					continue
+				}
+				translations = append(translations, models.Translation{
+					LanguageCode: langCode,
+					Content:      content,
+				})
+				filledLanguages[langCode] = true
+			}
+
+			term := models.Term{
+				ProjectID:    projectID,
+				Module:       strings.TrimSpace(data.Module),
+				Key:          strings.TrimSpace(data.Key),
+				Description:  strings.TrimSpace(data.Description),
+				Status:       batchCreateStatus(projectLangs, filledLanguages),
+				Translations: translations,
+			}
+
+			if err := tx.Create(&term).Error; err != nil {
+				return err
+			}
+			created = append(created, BatchCreatedTerm{ClientID: data.ClientID, Term: term})
+			termKeys = append(termKeys, term.Key)
+		}
+
+		return tx.Create(&models.ProjectHistoryLog{
+			ProjectID: projectID,
+			UserID:    userID,
+			Action:    "通过快捷批量创建录入",
+			ItemCount: len(created),
+			TermKeys:  termKeys,
+		}).Error
+	})
+
+	return created, err
 }
 
 func (r *TermRepository) BatchUpdate(projectID uint, updateData []BatchUpdateTerm, userID uint) (int, error) {
@@ -641,16 +770,64 @@ func (r *TermRepository) ImportJSONItems(projectID uint, langCode string, items 
 	return
 }
 
-// ProjectLogs returns recent logs for a project
-func (r *TermRepository) ProjectLogs(projectID uint, limit int) ([]models.HistoryLog, error) {
-	var logs []models.HistoryLog
-	err := r.db.
+// ProjectLogs returns recent term-level and project-level logs in one timeline.
+func (r *TermRepository) ProjectLogs(projectID uint, limit int) ([]ProjectActivityLog, error) {
+	var termLogs []models.HistoryLog
+	if err := r.db.
 		Joins("JOIN terms ON terms.id = history_logs.term_id").
 		Where("terms.project_id = ?", projectID).
 		Preload("User").
 		Preload("Term").
 		Order("history_logs.created_at DESC").
 		Limit(limit).
-		Find(&logs).Error
-	return logs, err
+		Find(&termLogs).Error; err != nil {
+		return nil, err
+	}
+
+	var projectLogs []models.ProjectHistoryLog
+	if err := r.db.
+		Where("project_id = ?", projectID).
+		Preload("User").
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&projectLogs).Error; err != nil {
+		return nil, err
+	}
+
+	logs := make([]ProjectActivityLog, 0, len(termLogs)+len(projectLogs))
+	for i := range termLogs {
+		log := &termLogs[i]
+		termID := log.TermID
+		logs = append(logs, ProjectActivityLog{
+			ID:        fmt.Sprintf("term-%d", log.ID),
+			Scope:     "term",
+			TermID:    &termID,
+			UserID:    log.UserID,
+			Action:    log.Action,
+			CreatedAt: log.CreatedAt,
+			Term:      &log.Term,
+			User:      log.User,
+		})
+	}
+	for i := range projectLogs {
+		log := &projectLogs[i]
+		logs = append(logs, ProjectActivityLog{
+			ID:        fmt.Sprintf("project-%d", log.ID),
+			Scope:     "project",
+			UserID:    log.UserID,
+			Action:    log.Action,
+			ItemCount: log.ItemCount,
+			TermKeys:  log.TermKeys,
+			CreatedAt: log.CreatedAt,
+			User:      log.User,
+		})
+	}
+
+	sort.SliceStable(logs, func(i, j int) bool {
+		return logs[i].CreatedAt.After(logs[j].CreatedAt)
+	})
+	if len(logs) > limit {
+		logs = logs[:limit]
+	}
+	return logs, nil
 }

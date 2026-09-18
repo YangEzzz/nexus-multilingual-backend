@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"choice-matrix-backend/internal/models"
 	"choice-matrix-backend/internal/repository"
@@ -11,11 +12,12 @@ import (
 )
 
 type LanguageHandler struct {
-	repo *repository.LanguageRepository
+	repo          *repository.LanguageRepository
+	availableRepo *repository.AvailableLanguageRepository
 }
 
-func NewLanguageHandler(repo *repository.LanguageRepository) *LanguageHandler {
-	return &LanguageHandler{repo: repo}
+func NewLanguageHandler(repo *repository.LanguageRepository, availableRepo *repository.AvailableLanguageRepository) *LanguageHandler {
+	return &LanguageHandler{repo: repo, availableRepo: availableRepo}
 }
 
 // Get GET /projects/:id/languages
@@ -56,13 +58,35 @@ func (h *LanguageHandler) Update(c *gin.Context) {
 	}
 
 	langs := make([]models.Language, 0, len(req))
+	codes := make([]string, 0, len(req))
+	seen := make(map[string]bool, len(req))
 	for _, item := range req {
+		item.Code = strings.ToLower(strings.TrimSpace(item.Code))
+		item.Name = strings.TrimSpace(item.Name)
+		if seen[item.Code] {
+			c.JSON(http.StatusOK, gin.H{"code": 400, "message": "项目语言不能重复"})
+			return
+		}
+		seen[item.Code] = true
+		codes = append(codes, item.Code)
 		langs = append(langs, models.Language{
 			ProjectID: uint(projectID),
 			Code:      item.Code,
 			Name:      item.Name,
 			IsSource:  item.IsSource,
 		})
+	}
+	availableLanguages, err := h.availableRepo.FindByCodes(codes)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "校验可选语言失败"})
+		return
+	}
+	if len(availableLanguages) != len(codes) {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "包含未配置的可选语言，请刷新后重试"})
+		return
+	}
+	for index := range langs {
+		langs[index].Name = availableLanguages[langs[index].Code].Name
 	}
 
 	if err := h.repo.SetForProject(uint(projectID), langs); err != nil {

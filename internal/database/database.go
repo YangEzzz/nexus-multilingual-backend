@@ -26,8 +26,8 @@ func ConnectDB(cfg config.Config) {
 	// 优化连接池设置，避免本地并发查询时反复耗时建立新连接
 	sqlDB, err := DB.DB()
 	if err == nil {
-		sqlDB.SetMaxIdleConns(10)   // 限制最大空闲连接
-		sqlDB.SetMaxOpenConns(100)  // 限制最大打开连接数
+		sqlDB.SetMaxIdleConns(10)  // 限制最大空闲连接
+		sqlDB.SetMaxOpenConns(100) // 限制最大打开连接数
 	}
 
 	log.Println("Database connection successfully opened")
@@ -37,13 +37,18 @@ func ConnectDB(cfg config.Config) {
 		err = DB.AutoMigrate(
 			&models.User{},
 			&models.I18nProject{},
+			&models.AvailableLanguage{},
 			&models.Language{},
 			&models.Term{},
 			&models.Translation{},
 			&models.HistoryLog{},
+			&models.ProjectHistoryLog{},
 		)
 		if err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
+		}
+		if err := seedAvailableLanguages(DB); err != nil {
+			log.Fatalf("Failed to seed available languages: %v", err)
 		}
 		log.Println("Database migration completed")
 	} else {

@@ -3,6 +3,8 @@ package handlers
 import (
 	"net/http"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"choice-matrix-backend/internal/models"
 	"choice-matrix-backend/internal/repository"
@@ -124,6 +126,102 @@ func (h *TermHandler) Create(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "词条创建成功", "data": term})
+}
+
+// BatchCreateTerms POST /projects/:id/terms/batch-create
+func (h *TermHandler) BatchCreateTerms(c *gin.Context) {
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "无效的项目 ID"})
+		return
+	}
+
+	var req struct {
+		Terms []repository.BatchCreateTerm `json:"terms" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误: " + err.Error()})
+		return
+	}
+	if len(req.Terms) == 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "请至少提交一个词条"})
+		return
+	}
+	if len(req.Terms) > 500 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "单次最多创建 500 个词条"})
+		return
+	}
+
+	type validationError struct {
+		ClientID string `json:"clientId"`
+		Field    string `json:"field"`
+		Reason   string `json:"reason"`
+		Message  string `json:"message"`
+	}
+	validationErrors := make([]validationError, 0)
+	seen := make(map[string]string, len(req.Terms))
+
+	for i := range req.Terms {
+		term := &req.Terms[i]
+		term.ClientID = strings.TrimSpace(term.ClientID)
+		term.Module = strings.TrimSpace(term.Module)
+		term.Key = strings.TrimSpace(term.Key)
+		term.Description = strings.TrimSpace(term.Description)
+		if term.ClientID == "" {
+			term.ClientID = "row-" + strconv.Itoa(i+1)
+		}
+
+		if term.Key == "" {
+			validationErrors = append(validationErrors, validationError{term.ClientID, "key", "required", "请填写 Key"})
+		} else if utf8.RuneCountInString(term.Key) > 255 {
+			validationErrors = append(validationErrors, validationError{term.ClientID, "key", "too_long", "Key 不能超过 255 个字符"})
+		}
+		if utf8.RuneCountInString(term.Module) > 100 {
+			validationErrors = append(validationErrors, validationError{term.ClientID, "module", "too_long", "模块不能超过 100 个字符"})
+		}
+
+		identity := term.Module + "\x00" + term.Key
+		if firstClientID, exists := seen[identity]; term.Key != "" && exists {
+			validationErrors = append(validationErrors, validationError{
+				term.ClientID,
+				"key",
+				"duplicate_in_batch",
+				"与本批次中的词条 " + firstClientID + " 重复",
+			})
+		} else if term.Key != "" {
+			seen[identity] = term.ClientID
+		}
+	}
+
+	if len(validationErrors) > 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"code":    400,
+			"message": "请修正批量创建数据",
+			"data":    gin.H{"errors": validationErrors},
+		})
+		return
+	}
+
+	userID, ok := c.Get("userID")
+	if !ok {
+		c.JSON(http.StatusOK, gin.H{"code": 401, "message": "用户未登录"})
+		return
+	}
+
+	created, err := h.repo.BatchCreate(uint(projectID), req.Terms, userID.(uint))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 409, "message": "批量创建失败，请检查 Key、模块和项目语言配置后重试"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    200,
+		"message": "批量创建成功",
+		"data": gin.H{
+			"createdCount": len(created),
+			"terms":        created,
+		},
+	})
 }
 
 // UpdateTerm POST /projects/:id/terms/:termId/update

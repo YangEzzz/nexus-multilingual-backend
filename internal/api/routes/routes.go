@@ -15,12 +15,14 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB) {
 	i18nProjectRepo := repository.NewI18nProjectRepository(db)
 	termRepo := repository.NewTermRepository(db)
 	langRepo := repository.NewLanguageRepository(db)
+	availableLangRepo := repository.NewAvailableLanguageRepository(db)
 
 	// Handlers
 	authHandler := handlers.NewAuthHandler(userRepo)
 	i18nProjectHandler := handlers.NewI18nProjectHandler(i18nProjectRepo, termRepo)
 	termHandler := handlers.NewTermHandler(termRepo)
-	langHandler := handlers.NewLanguageHandler(langRepo)
+	langHandler := handlers.NewLanguageHandler(langRepo, availableLangRepo)
+	availableLangHandler := handlers.NewAvailableLanguageHandler(availableLangRepo)
 
 	api := r.Group("/api/v1")
 	{
@@ -39,6 +41,14 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB) {
 		protected.Use(middleware.AuthMiddleware())
 		{
 			protected.GET("/auth/me", authHandler.GetCurrentUser)
+			protected.GET("/languages", availableLangHandler.List)
+			languageAdmin := protected.Group("/languages")
+			languageAdmin.Use(middleware.AdminMiddleware(db))
+			{
+				languageAdmin.POST("", availableLangHandler.Create)
+				languageAdmin.POST("/:id/update", availableLangHandler.Update)
+				languageAdmin.POST("/:id/delete", availableLangHandler.Delete)
+			}
 
 			// I18n Projects CRUD
 			projects := protected.Group("/projects")
@@ -54,6 +64,7 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB) {
 				projects.GET("/:id/terms", termHandler.List)
 				projects.GET("/:id/stats", termHandler.GetStats)
 				projects.POST("/:id/terms", termHandler.Create)
+				projects.POST("/:id/terms/batch-create", termHandler.BatchCreateTerms)
 				projects.POST("/:id/terms/:termId/update", termHandler.UpdateTerm)
 				projects.POST("/:id/terms/batch-update", termHandler.BatchUpdateTerms)
 				projects.POST("/:id/terms/:termId/publish", termHandler.PublishTerm)
@@ -61,7 +72,7 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB) {
 				projects.POST("/:id/terms/import-json", termHandler.ImportJSON)
 				projects.POST("/:id/terms/batch-publish", termHandler.BatchPublishTerms)
 				projects.POST("/:id/terms/batch-delete", termHandler.BatchDeleteTerms)
-				
+
 				// Project logs
 				projects.GET("/:id/logs", termHandler.GetProjectLogs)
 
