@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"choice-matrix-backend/internal/models"
 	"choice-matrix-backend/internal/repository"
+	"choice-matrix-backend/internal/utils"
 
 	"github.com/gin-gonic/gin"
 )
@@ -16,8 +18,88 @@ type TermHandler struct {
 	repo *repository.TermRepository
 }
 
+type termBulkRequest struct {
+	Operation repository.BulkOperation `json:"operation" binding:"required"`
+	Scope     repository.TermBulkScope `json:"scope" binding:"required"`
+}
+
+type termExportRequest struct {
+	Scope     repository.TermBulkScope `json:"scope" binding:"required"`
+	Languages []string                 `json:"languages"`
+}
+
+type termCopyRequest struct {
+	Scope    repository.TermBulkScope `json:"scope" binding:"required"`
+	Language string                   `json:"language" binding:"required"`
+}
+
 func NewTermHandler(repo *repository.TermRepository) *TermHandler {
 	return &TermHandler{repo: repo}
+}
+
+func bindTermBulkRequest(c *gin.Context) (uint, termBulkRequest, bool) {
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || projectID <= 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "无效的项目 ID"})
+		return 0, termBulkRequest{}, false
+	}
+
+	var req termBulkRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误: " + err.Error()})
+		return 0, termBulkRequest{}, false
+	}
+	if !repository.IsValidBulkOperation(req.Operation) {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "不支持的批量操作"})
+		return 0, termBulkRequest{}, false
+	}
+	if req.Scope.Mode != "explicit" && req.Scope.Mode != "filtered" {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "不支持的选择范围"})
+		return 0, termBulkRequest{}, false
+	}
+	if req.Scope.Mode == "explicit" && len(req.Scope.IDs) == 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "请至少选择一个词条"})
+		return 0, termBulkRequest{}, false
+	}
+	return uint(projectID), req, true
+}
+
+func validateTermScope(c *gin.Context, scope repository.TermBulkScope) bool {
+	if scope.Mode != "explicit" && scope.Mode != "filtered" {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "不支持的选择范围"})
+		return false
+	}
+	if scope.Mode == "explicit" && len(scope.IDs) == 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "请至少选择一个词条"})
+		return false
+	}
+	return true
+}
+
+func exportLanguageCodes(projectLanguages []models.Language, requested []string) ([]string, bool) {
+	allowed := make(map[string]bool, len(projectLanguages))
+	for _, language := range projectLanguages {
+		allowed[language.Code] = true
+	}
+	if len(requested) == 0 {
+		codes := make([]string, 0, len(projectLanguages))
+		for _, language := range projectLanguages {
+			codes = append(codes, language.Code)
+		}
+		return codes, true
+	}
+	seen := make(map[string]bool, len(requested))
+	codes := make([]string, 0, len(requested))
+	for _, code := range requested {
+		if !allowed[code] {
+			return nil, false
+		}
+		if !seen[code] {
+			seen[code] = true
+			codes = append(codes, code)
+		}
+	}
+	return codes, true
 }
 
 // List GET /projects/:id/terms
@@ -29,13 +111,24 @@ func (h *TermHandler) List(c *gin.Context) {
 		return
 	}
 
-	terms, err := h.repo.ListByProject(uint(projectID))
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	result, err := h.repo.ListByProjectPage(uint(projectID), repository.TermListFilter{
+		Page:          page,
+		PageSize:      pageSize,
+		Search:        c.Query("search"),
+		ChineseSearch: c.Query("chinese_search"),
+		EnglishSearch: c.Query("english_search"),
+		Module:        c.Query("module"),
+		Status:        c.Query("status"),
+		ExcludeDraft:  c.Query("exclude_draft") == "true",
+	})
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "获取词条失败"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "ok", "data": terms})
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "ok", "data": result})
 }
 
 // GetStats GET /projects/:id/stats
@@ -313,6 +406,170 @@ func (h *TermHandler) PublishTerm(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "发布成功"})
+}
+
+// PreviewBulkTerms POST /projects/:id/terms/bulk/preview
+func (h *TermHandler) PreviewBulkTerms(c *gin.Context) {
+	projectID, req, ok := bindTermBulkRequest(c)
+	if !ok {
+		return
+	}
+	result, err := h.repo.PreviewBulk(projectID, req.Operation, req.Scope)
+	if err != nil {
+		log.Printf("bulk preview failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "批量操作预检查失败，请刷新后重试"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "预检查完成", "data": result})
+}
+
+// ExecuteBulkTerms POST /projects/:id/terms/bulk/execute
+func (h *TermHandler) ExecuteBulkTerms(c *gin.Context) {
+	projectID, req, ok := bindTermBulkRequest(c)
+	if !ok {
+		return
+	}
+	userIDValue, exists := c.Get("userID")
+	userID, validUserID := userIDValue.(uint)
+	if !exists || !validUserID {
+		c.JSON(http.StatusOK, gin.H{"code": 401, "message": "登录状态已失效"})
+		return
+	}
+	result, err := h.repo.ExecuteBulk(projectID, userID, req.Operation, req.Scope)
+	if err != nil {
+		log.Printf("bulk execution failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "批量操作未完成，请重试"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "批量操作完成", "data": result})
+}
+
+// ExportTermsJSON POST /projects/:id/terms/export/json
+func (h *TermHandler) ExportTermsJSON(c *gin.Context) {
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || projectID <= 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "无效的项目 ID"})
+		return
+	}
+	var req termExportRequest
+	if err := c.ShouldBindJSON(&req); err != nil || !validateTermScope(c, req.Scope) {
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误"})
+		}
+		return
+	}
+	terms, err := h.repo.TermsForScope(uint(projectID), req.Scope)
+	if err != nil {
+		log.Printf("JSON export scope failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取导出数据失败"})
+		return
+	}
+	languages, err := h.repo.ProjectLanguages(uint(projectID))
+	if err != nil {
+		log.Printf("JSON export languages failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取项目语言失败"})
+		return
+	}
+	codes, valid := exportLanguageCodes(languages, req.Languages)
+	if !valid || len(codes) == 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "导出语言未配置在当前项目中"})
+		return
+	}
+	content, err := utils.BuildLanguageJSONArchive(terms, codes)
+	if err != nil {
+		log.Printf("JSON archive failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "生成 JSON 压缩包失败"})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="translations.zip"`)
+	c.Data(http.StatusOK, "application/zip", content)
+}
+
+// ExportTermsExcel POST /projects/:id/terms/export/excel
+func (h *TermHandler) ExportTermsExcel(c *gin.Context) {
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || projectID <= 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "无效的项目 ID"})
+		return
+	}
+	var req termExportRequest
+	if err := c.ShouldBindJSON(&req); err != nil || !validateTermScope(c, req.Scope) {
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误"})
+		}
+		return
+	}
+	terms, err := h.repo.TermsForScope(uint(projectID), req.Scope)
+	if err != nil {
+		log.Printf("Excel export scope failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取导出数据失败"})
+		return
+	}
+	languages, err := h.repo.ProjectLanguages(uint(projectID))
+	if err != nil {
+		log.Printf("Excel export languages failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取项目语言失败"})
+		return
+	}
+	content, err := utils.BuildTermXLSX(terms, languages)
+	if err != nil {
+		log.Printf("Excel generation failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "生成 Excel 文件失败"})
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="translations.xlsx"`)
+	c.Data(http.StatusOK, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", content)
+}
+
+// CopyTermsJSON POST /projects/:id/terms/export/copy
+func (h *TermHandler) CopyTermsJSON(c *gin.Context) {
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || projectID <= 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "无效的项目 ID"})
+		return
+	}
+	var req termCopyRequest
+	if err := c.ShouldBindJSON(&req); err != nil || !validateTermScope(c, req.Scope) {
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误"})
+		}
+		return
+	}
+	languages, err := h.repo.ProjectLanguages(uint(projectID))
+	if err != nil {
+		log.Printf("copy languages failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取项目语言失败"})
+		return
+	}
+	codes, valid := exportLanguageCodes(languages, []string{req.Language})
+	if !valid || len(codes) != 1 {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "复制语言未配置在当前项目中"})
+		return
+	}
+	terms, err := h.repo.TermsForScope(uint(projectID), req.Scope)
+	if err != nil {
+		log.Printf("copy scope failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "读取复制数据失败"})
+		return
+	}
+	if len(terms) > 1000 {
+		c.JSON(http.StatusOK, gin.H{"code": 413, "message": "复制最多支持 1000 条，请改用 JSON 导出"})
+		return
+	}
+	content, err := utils.BuildLanguageJSON(terms, req.Language)
+	if err != nil {
+		log.Printf("copy JSON generation failed for project %d: %v", projectID, err)
+		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "生成复制内容失败"})
+		return
+	}
+	if len(content) > 1024*1024 {
+		c.JSON(http.StatusOK, gin.H{"code": 413, "message": "复制内容超过 1MB，请改用 JSON 导出"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "复制内容已生成", "data": gin.H{
+		"content": string(content),
+		"count":   len(terms),
+	}})
 }
 
 // BatchPublishTerms POST /projects/:id/terms/batch-publish

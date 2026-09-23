@@ -39,5 +39,36 @@ func (r *I18nProjectRepository) Update(project *models.I18nProject) error {
 }
 
 func (r *I18nProjectRepository) Delete(id uint) error {
-	return r.db.Delete(&models.I18nProject{}, id).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// Terms reference the project, and translations/history logs reference
+		// those terms. Remove the dependent rows first so this works with the
+		// existing database constraints (which do not all cascade on delete).
+		var termIDs []uint
+		if err := tx.Model(&models.Term{}).
+			Where("project_id = ?", id).
+			Pluck("id", &termIDs).Error; err != nil {
+			return err
+		}
+
+		if len(termIDs) > 0 {
+			if err := tx.Where("term_id IN ?", termIDs).Delete(&models.Translation{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("term_id IN ?", termIDs).Delete(&models.HistoryLog{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", termIDs).Delete(&models.Term{}).Error; err != nil {
+				return err
+			}
+		}
+
+		if err := tx.Where("project_id = ?", id).Delete(&models.Language{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("project_id = ?", id).Delete(&models.ProjectHistoryLog{}).Error; err != nil {
+			return err
+		}
+
+		return tx.Delete(&models.I18nProject{}, id).Error
+	})
 }

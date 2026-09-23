@@ -20,17 +20,465 @@ func NewTermRepository(db *gorm.DB) *TermRepository {
 	return &TermRepository{db: db}
 }
 
-// ListByProject returns all terms for a project, preloading their translations
-func (r *TermRepository) ListByProject(projectID uint) ([]models.Term, error) {
-	var terms []models.Term
-	err := r.db.Preload("Translations").
-		Preload("HistoryLogs", func(db *gorm.DB) *gorm.DB {
-			return db.Order("created_at DESC")
-		}).
-		Where("project_id = ?", projectID).
-		Order("created_at DESC").
-		Find(&terms).Error
+type TermListFilter struct {
+	Page          int    `json:"page,omitempty"`
+	PageSize      int    `json:"page_size,omitempty"`
+	Search        string `json:"search,omitempty"`
+	ChineseSearch string `json:"chinese_search,omitempty"`
+	EnglishSearch string `json:"english_search,omitempty"`
+	Module        string `json:"module,omitempty"`
+	Status        string `json:"status,omitempty"`
+	ExcludeDraft  bool   `json:"exclude_draft,omitempty"`
+}
+
+type TermListSummary struct {
+	Total            int64            `json:"total"`
+	StatusCounts     map[string]int64 `json:"status_counts"`
+	ReadyReviewCount int64            `json:"ready_review_count"`
+}
+
+type TermListResult struct {
+	Items          []models.Term    `json:"items"`
+	Total          int64            `json:"total"`
+	Page           int              `json:"page"`
+	PageSize       int              `json:"page_size"`
+	TotalPages     int              `json:"total_pages"`
+	StatusCounts   map[string]int64 `json:"status_counts"`
+	Modules        []string         `json:"modules"`
+	ProjectSummary TermListSummary  `json:"project_summary"`
+}
+
+type BulkOperation string
+
+const (
+	BulkOperationApproveReview BulkOperation = "approve_review"
+	BulkOperationPublish       BulkOperation = "publish"
+	BulkOperationDelete        BulkOperation = "delete"
+)
+
+type TermBulkScope struct {
+	Mode        string         `json:"mode"`
+	IDs         []uint         `json:"ids,omitempty"`
+	Filter      TermListFilter `json:"filter,omitempty"`
+	ExcludedIDs []uint         `json:"excluded_ids,omitempty"`
+}
+
+type TermBulkResult struct {
+	Operation    BulkOperation    `json:"operation"`
+	Matched      int              `json:"matched"`
+	Executable   int              `json:"executable"`
+	Succeeded    int              `json:"succeeded"`
+	Skipped      int              `json:"skipped"`
+	StatusCounts map[string]int64 `json:"status_counts"`
+	SkipReasons  map[string]int   `json:"skip_reasons"`
+}
+
+func IsValidBulkOperation(operation BulkOperation) bool {
+	switch operation {
+	case BulkOperationApproveReview, BulkOperationPublish, BulkOperationDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+const readyReviewCondition = `
+	terms.status NOT IN (?, ?)
+	AND TRIM(terms.key) <> ''
+	AND NOT EXISTS (
+		SELECT 1 FROM languages
+		WHERE languages.project_id = terms.project_id
+		AND NOT EXISTS (
+			SELECT 1 FROM translations
+			WHERE translations.term_id = terms.id
+			AND translations.language_code = languages.code
+			AND TRIM(translations.content) <> ''
+		)
+	)`
+
+func termListBaseQuery(db *gorm.DB, projectID uint, filter TermListFilter) *gorm.DB {
+	query := db.Model(&models.Term{}).Where("terms.project_id = ?", projectID)
+	if filter.ExcludeDraft {
+		query = query.Where("terms.status <> ?", models.TermStatusDraft)
+	}
+	if search := strings.TrimSpace(filter.Search); search != "" {
+		pattern := "%" + strings.ToLower(search) + "%"
+		query = query.Where("LOWER(terms.key) LIKE ? OR LOWER(terms.module) LIKE ?", pattern, pattern)
+	}
+	if search := strings.TrimSpace(filter.ChineseSearch); search != "" {
+		pattern := "%" + strings.ToLower(search) + "%"
+		query = query.Where(`EXISTS (
+			SELECT 1 FROM translations
+			WHERE translations.term_id = terms.id
+			AND translations.language_code IN ?
+			AND LOWER(translations.content) LIKE ?
+		)`, []string{"cn", "zh", "zh-CN", "cht"}, pattern)
+	}
+	if search := strings.TrimSpace(filter.EnglishSearch); search != "" {
+		pattern := "%" + strings.ToLower(search) + "%"
+		query = query.Where(`EXISTS (
+			SELECT 1 FROM translations
+			WHERE translations.term_id = terms.id
+			AND translations.language_code = ?
+			AND LOWER(translations.content) LIKE ?
+		)`, "en", pattern)
+	}
+	if filter.Module == "__none__" {
+		query = query.Where("terms.module = ''")
+	} else if filter.Module != "" && filter.Module != "all" {
+		query = query.Where("terms.module = ?", filter.Module)
+	}
+	if filter.Status == "ready_review" {
+		query = query.Where(readyReviewCondition, models.TermStatusReview, models.TermStatusPublished)
+	} else if filter.Status != "" && filter.Status != "all" {
+		query = query.Where("terms.status = ?", filter.Status)
+	}
+	return query
+}
+
+func termStatusCounts(query *gorm.DB) (map[string]int64, error) {
+	type statusCount struct {
+		Status string
+		Count  int64
+	}
+	rows := make([]statusCount, 0, 4)
+	if err := query.Select("terms.status, count(*) AS count").Group("terms.status").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	counts := map[string]int64{"draft": 0, "pending": 0, "review": 0, "published": 0}
+	for _, row := range rows {
+		counts[row.Status] = row.Count
+	}
+	return counts, nil
+}
+
+// ListByProjectPage returns one filtered page plus the aggregate data required
+// to render pagination, selection scope, filters, and project summary cards.
+func (r *TermRepository) ListByProjectPage(projectID uint, filter TermListFilter) (*TermListResult, error) {
+	if filter.Page < 1 {
+		filter.Page = 1
+	}
+	if filter.PageSize < 1 {
+		filter.PageSize = 20
+	}
+	if filter.PageSize > 200 {
+		filter.PageSize = 200
+	}
+
+	filteredQuery := termListBaseQuery(r.db, projectID, filter)
+	var total int64
+	if err := filteredQuery.Count(&total).Error; err != nil {
+		return nil, err
+	}
+	statusCounts, err := termStatusCounts(termListBaseQuery(r.db, projectID, filter))
+	if err != nil {
+		return nil, err
+	}
+
+	var modules []string
+	moduleQuery := r.db.Model(&models.Term{}).Where("project_id = ?", projectID)
+	if filter.ExcludeDraft {
+		moduleQuery = moduleQuery.Where("status <> ?", models.TermStatusDraft)
+	}
+	if err := moduleQuery.Distinct("module").Order("module ASC").Pluck("module", &modules).Error; err != nil {
+		return nil, err
+	}
+
+	projectFilter := TermListFilter{ExcludeDraft: filter.ExcludeDraft}
+	projectQuery := termListBaseQuery(r.db, projectID, projectFilter)
+	var projectTotal int64
+	if err := projectQuery.Count(&projectTotal).Error; err != nil {
+		return nil, err
+	}
+	projectStatusCounts, err := termStatusCounts(termListBaseQuery(r.db, projectID, projectFilter))
+	if err != nil {
+		return nil, err
+	}
+	var readyReviewCount int64
+	if err := termListBaseQuery(r.db, projectID, projectFilter).
+		Where(readyReviewCondition, models.TermStatusReview, models.TermStatusPublished).
+		Count(&readyReviewCount).Error; err != nil {
+		return nil, err
+	}
+
+	totalPages := int((total + int64(filter.PageSize) - 1) / int64(filter.PageSize))
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	if filter.Page > totalPages {
+		filter.Page = totalPages
+	}
+
+	items := make([]models.Term, 0, filter.PageSize)
+	if err := termListBaseQuery(r.db, projectID, filter).
+		Preload("Translations").
+		Preload("HistoryLogs", func(db *gorm.DB) *gorm.DB { return db.Order("created_at DESC") }).
+		Order("terms.created_at DESC").
+		Offset((filter.Page - 1) * filter.PageSize).
+		Limit(filter.PageSize).
+		Find(&items).Error; err != nil {
+		return nil, err
+	}
+
+	return &TermListResult{
+		Items:        items,
+		Total:        total,
+		Page:         filter.Page,
+		PageSize:     filter.PageSize,
+		TotalPages:   totalPages,
+		StatusCounts: statusCounts,
+		Modules:      modules,
+		ProjectSummary: TermListSummary{
+			Total:            projectTotal,
+			StatusCounts:     projectStatusCounts,
+			ReadyReviewCount: readyReviewCount,
+		},
+	}, nil
+}
+
+func termBulkScopeQuery(db *gorm.DB, projectID uint, scope TermBulkScope) (*gorm.DB, error) {
+	var query *gorm.DB
+	switch scope.Mode {
+	case "explicit":
+		if len(scope.IDs) == 0 {
+			return nil, fmt.Errorf("请至少选择一个词条")
+		}
+		query = db.Model(&models.Term{}).
+			Where("terms.project_id = ?", projectID).
+			Where("terms.id IN ?", scope.IDs)
+	case "filtered":
+		query = termListBaseQuery(db, projectID, scope.Filter)
+	default:
+		return nil, fmt.Errorf("不支持的选择范围")
+	}
+
+	if len(scope.ExcludedIDs) > 0 {
+		query = query.Where("terms.id NOT IN ?", scope.ExcludedIDs)
+	}
+	return query, nil
+}
+
+func loadScopedTerms(db *gorm.DB, projectID uint, scope TermBulkScope, lock bool) ([]models.Term, error) {
+	query, err := termBulkScopeQuery(db, projectID, scope)
+	if err != nil {
+		return nil, err
+	}
+	if lock {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	terms := make([]models.Term, 0)
+	err = query.Preload("Translations").Order("terms.id ASC").Find(&terms).Error
 	return terms, err
+}
+
+func termTranslationMap(term models.Term) map[string]string {
+	translations := make(map[string]string, len(term.Translations))
+	for _, translation := range term.Translations {
+		translations[translation.LanguageCode] = translation.Content
+	}
+	return translations
+}
+
+func hasMissingProjectTranslation(term models.Term, projectLanguages []models.Language) bool {
+	translations := termTranslationMap(term)
+	for _, language := range projectLanguages {
+		if strings.TrimSpace(translations[language.Code]) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPlaceholderMismatch(term models.Term, projectLanguages []models.Language) bool {
+	translations := termTranslationMap(term)
+	source := pickPlaceholderSource(term, projectLanguages, translations)
+	if len(utils.ExtractPlaceholders(source)) == 0 {
+		return false
+	}
+	for _, language := range projectLanguages {
+		missing, extra := utils.DiffPlaceholders(source, translations[language.Code])
+		if len(missing) > 0 || len(extra) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func bulkSkipReason(term models.Term, projectLanguages []models.Language, operation BulkOperation) string {
+	switch operation {
+	case BulkOperationApproveReview:
+		if term.Status == models.TermStatusReview || term.Status == models.TermStatusPublished {
+			return "status_not_allowed"
+		}
+	case BulkOperationPublish:
+		if term.Status != models.TermStatusReview {
+			return "status_not_allowed"
+		}
+	case BulkOperationDelete:
+		if term.Status == models.TermStatusPublished {
+			return "published_protected"
+		}
+		return ""
+	}
+
+	if strings.TrimSpace(term.Key) == "" {
+		return "missing_key"
+	}
+	if hasMissingProjectTranslation(term, projectLanguages) {
+		return "missing_translation"
+	}
+	if hasPlaceholderMismatch(term, projectLanguages) {
+		return "placeholder_mismatch"
+	}
+	return ""
+}
+
+func evaluateBulkTerms(terms []models.Term, projectLanguages []models.Language, operation BulkOperation) (TermBulkResult, []models.Term) {
+	result := TermBulkResult{
+		Operation:    operation,
+		Matched:      len(terms),
+		StatusCounts: map[string]int64{"draft": 0, "pending": 0, "review": 0, "published": 0},
+		SkipReasons:  make(map[string]int),
+	}
+	eligible := make([]models.Term, 0, len(terms))
+	for _, term := range terms {
+		result.StatusCounts[string(term.Status)]++
+		if reason := bulkSkipReason(term, projectLanguages, operation); reason != "" {
+			result.SkipReasons[reason]++
+			continue
+		}
+		eligible = append(eligible, term)
+	}
+	result.Executable = len(eligible)
+	result.Skipped = result.Matched - result.Executable
+	return result, eligible
+}
+
+func loadProjectLanguages(db *gorm.DB, projectID uint) ([]models.Language, error) {
+	var languages []models.Language
+	err := db.Where("project_id = ?", projectID).Order("id ASC").Find(&languages).Error
+	return languages, err
+}
+
+func (r *TermRepository) PreviewBulk(projectID uint, operation BulkOperation, scope TermBulkScope) (*TermBulkResult, error) {
+	if !IsValidBulkOperation(operation) {
+		return nil, fmt.Errorf("不支持的批量操作")
+	}
+	terms, err := loadScopedTerms(r.db, projectID, scope, false)
+	if err != nil {
+		return nil, err
+	}
+	languages, err := loadProjectLanguages(r.db, projectID)
+	if err != nil {
+		return nil, err
+	}
+	result, _ := evaluateBulkTerms(terms, languages, operation)
+	return &result, nil
+}
+
+// TermsForScope resolves an explicit or filtered selection on the server.
+// Callers use this for read-only bulk operations such as export and AI jobs.
+func (r *TermRepository) TermsForScope(projectID uint, scope TermBulkScope) ([]models.Term, error) {
+	return loadScopedTerms(r.db, projectID, scope, false)
+}
+
+func (r *TermRepository) ProjectLanguages(projectID uint) ([]models.Language, error) {
+	return loadProjectLanguages(r.db, projectID)
+}
+
+func sampleTermKeys(terms []models.Term, limit int) []string {
+	if limit > len(terms) {
+		limit = len(terms)
+	}
+	keys := make([]string, 0, limit)
+	for _, term := range terms[:limit] {
+		keys = append(keys, term.Key)
+	}
+	return keys
+}
+
+func (r *TermRepository) ExecuteBulk(projectID uint, userID uint, operation BulkOperation, scope TermBulkScope) (*TermBulkResult, error) {
+	if !IsValidBulkOperation(operation) {
+		return nil, fmt.Errorf("不支持的批量操作")
+	}
+
+	var result TermBulkResult
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		terms, err := loadScopedTerms(tx, projectID, scope, true)
+		if err != nil {
+			return err
+		}
+		languages, err := loadProjectLanguages(tx, projectID)
+		if err != nil {
+			return err
+		}
+
+		var eligible []models.Term
+		result, eligible = evaluateBulkTerms(terms, languages, operation)
+		if len(eligible) == 0 {
+			return nil
+		}
+
+		ids := make([]uint, 0, len(eligible))
+		for _, term := range eligible {
+			ids = append(ids, term.ID)
+		}
+
+		action := ""
+		switch operation {
+		case BulkOperationApproveReview:
+			action = "批量校对通过"
+			if err := tx.Model(&models.Term{}).
+				Where("project_id = ? AND id IN ?", projectID, ids).
+				Update("status", models.TermStatusReview).Error; err != nil {
+				return err
+			}
+		case BulkOperationPublish:
+			action = "批量发布词条"
+			if err := tx.Model(&models.Term{}).
+				Where("project_id = ? AND id IN ?", projectID, ids).
+				Update("status", models.TermStatusPublished).Error; err != nil {
+				return err
+			}
+		case BulkOperationDelete:
+			action = "批量删除词条"
+			if err := tx.Where("term_id IN ?", ids).Delete(&models.Translation{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("term_id IN ?", ids).Delete(&models.HistoryLog{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("project_id = ? AND id IN ?", projectID, ids).Delete(&models.Term{}).Error; err != nil {
+				return err
+			}
+		}
+
+		if operation != BulkOperationDelete {
+			logs := make([]models.HistoryLog, 0, len(ids))
+			for _, id := range ids {
+				logs = append(logs, models.HistoryLog{TermID: id, UserID: userID, Action: action})
+			}
+			if err := tx.Create(&logs).Error; err != nil {
+				return err
+			}
+		}
+
+		if err := tx.Create(&models.ProjectHistoryLog{
+			ProjectID: projectID,
+			UserID:    userID,
+			Action:    action,
+			ItemCount: len(eligible),
+			TermKeys:  sampleTermKeys(eligible, 100),
+		}).Error; err != nil {
+			return err
+		}
+		result.Succeeded = len(eligible)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // ProjectStats holds summary data for the dashboard

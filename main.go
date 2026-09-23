@@ -35,7 +35,7 @@ func main() {
 	}))
 
 	// Register Routes
-	routes.RegisterRoutes(r, database.DB)
+	routes.RegisterRoutes(r, database.DB, cfg)
 
 	// Run Server
 	log.Printf("Starting server on port %s", cfg.Port)

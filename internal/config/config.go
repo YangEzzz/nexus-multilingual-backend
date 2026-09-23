@@ -9,15 +9,17 @@ import (
 )
 
 type Config struct {
-	Port           string
-	DBHost         string
-	DBUser         string
-	DBPass         string
-	DBName         string
-	DBPort         string
-	JWTSecret      string
-	AutoMigrate    bool
-	AllowedOrigins []string
+	Port               string
+	DBHost             string
+	DBUser             string
+	DBPass             string
+	DBName             string
+	DBPort             string
+	JWTSecret          string
+	AIKeyEncryptionKey string
+	AIRelayBaseURL     string
+	AutoMigrate        bool
+	AllowedOrigins     []string
 }
 
 func LoadConfig() Config {
@@ -39,15 +41,17 @@ func LoadConfig() Config {
 	}
 
 	return Config{
-		Port:           getEnv("PORT", "8080"),
-		DBHost:         getEnv("DB_HOST", "localhost"),
-		DBUser:         getEnv("DB_USER", "postgres"),
-		DBPass:         getEnv("DB_PASSWORD", getEnv("DB_PASS", "postgres")),
-		DBName:         getEnv("DB_NAME", "choice_matrix"),
-		DBPort:         getEnv("DB_PORT", "5432"),
-		JWTSecret:      getEnv("JWT_SECRET", "my-super-secret-choice-matrix-key"),
-		AutoMigrate:    getEnv("AUTO_MIGRATE", "false") == "true",
-		AllowedOrigins: allowedOrigins,
+		Port:               getEnv("PORT", "8080"),
+		DBHost:             getEnv("DB_HOST", "localhost"),
+		DBUser:             getEnv("DB_USER", "postgres"),
+		DBPass:             getEnv("DB_PASSWORD", getEnv("DB_PASS", "postgres")),
+		DBName:             getEnv("DB_NAME", "choice_matrix"),
+		DBPort:             getEnv("DB_PORT", "5432"),
+		JWTSecret:          getEnv("JWT_SECRET", "my-super-secret-choice-matrix-key"),
+		AIKeyEncryptionKey: getEnv("AI_KEY_ENCRYPTION_KEY", ""),
+		AIRelayBaseURL:     getEnv("AI_RELAY_BASE_URL", "https://43.172.5.210:3000/v1"),
+		AutoMigrate:        getEnv("AUTO_MIGRATE", "false") == "true",
+		AllowedOrigins:     allowedOrigins,
 	}
 }
 
