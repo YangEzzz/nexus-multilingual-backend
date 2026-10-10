@@ -25,19 +25,32 @@ func main() {
 	r.Use(gin.Recovery()) // Do not log authorization codes in callback query strings.
 
 	// Configure CORS
-	allowedOrigins := cfg.AllowedOrigins
-	if len(allowedOrigins) == 0 {
-		allowedOrigins = []string{cfg.FrontendURL}
+	r.Use(browserCORS(cfg))
+
+	// Register Routes
+	routes.RegisterRoutes(r, database.DB, cfg)
+
+	// Run Server
+	log.Printf("Starting server on port %s", cfg.Port)
+	if err := r.Run(":" + cfg.Port); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
-	protectedCORS := cors.New(cors.Config{
-		AllowOrigins:     allowedOrigins,
+}
+
+// Nginx proxies API requests and preflights; the service owns browser CORS.
+func browserCORS(cfg config.Config) gin.HandlerFunc {
+	origins := cfg.AllowedOrigins
+	if len(origins) == 0 {
+		origins = []string{cfg.FrontendURL}
+	}
+	protected := cors.New(cors.Config{
+		AllowOrigins:     origins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-CSRF-Token"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 	})
-	r.Use(func(c *gin.Context) {
-		// Published locale files are public assets consumed by other frontends.
+	return func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/api/v1/public/locales/") {
 			c.Header("Access-Control-Allow-Origin", "*")
 			c.Header("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -49,15 +62,6 @@ func main() {
 			c.Next()
 			return
 		}
-		protectedCORS(c)
-	})
-
-	// Register Routes
-	routes.RegisterRoutes(r, database.DB, cfg)
-
-	// Run Server
-	log.Printf("Starting server on port %s", cfg.Port)
-	if err := r.Run(":" + cfg.Port); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+		protected(c)
 	}
 }

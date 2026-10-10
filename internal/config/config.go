@@ -64,11 +64,11 @@ func LoadConfig() Config {
 		AllowedOrigins:     allowedOrigins,
 		FrontendURL:        getEnv("FRONTEND_URL", "http://localhost:5173"),
 		CookieSecure:       getEnv("COOKIE_SECURE", "true") == "true",
-		HeliosBaseURL:      getEnv("HELIOS_BASE_URL", "http://localhost:5174"),
+		HeliosBaseURL:      getEnv("HELIOS_BASE_URL", "https://helios-api.team-tool.top"),
 		HeliosInternalURL:  getEnv("HELIOS_INTERNAL_URL", "http://127.0.0.1:3456"),
 		HeliosClientID:     getEnv("HELIOS_CLIENT_ID", ""),
 		HeliosClientSecret: getEnv("HELIOS_CLIENT_SECRET", ""),
-		HeliosRedirectURI:  getEnv("HELIOS_REDIRECT_URI", "http://localhost:5173/api/v1/auth/sso/callback"),
+		HeliosRedirectURI:  getEnv("HELIOS_REDIRECT_URI", "https://nexus-api.team-tool.top/api/v1/auth/sso/callback"),
 		HeliosProjectID:    getEnv("HELIOS_PROJECT_ID", "nexus-multilingual"),
 		HeliosAllowedRoles: strings.Split(getEnv("HELIOS_ALLOWED_ROLES", "admin,owner,productor,developer,translator"), ","),
 	}
