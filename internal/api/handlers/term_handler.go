@@ -581,7 +581,12 @@ func (h *TermHandler) BatchPublishTerms(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "参数错误: " + err.Error()})
 		return
 	}
-	userID := uint(1) // FIXME: extract from JWT
+	userIDValue, exists := c.Get("userID")
+	userID, validUserID := userIDValue.(uint)
+	if !exists || !validUserID || userID == 0 {
+		c.JSON(http.StatusOK, gin.H{"code": 401, "message": "登录状态已失效"})
+		return
+	}
 	if err := h.repo.BatchPublish(req.IDs, userID); err != nil {
 		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "批量发布失败: " + err.Error()})
 		return

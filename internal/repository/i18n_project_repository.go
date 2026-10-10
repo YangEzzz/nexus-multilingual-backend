@@ -40,6 +40,18 @@ func (r *I18nProjectRepository) Update(project *models.I18nProject) error {
 
 func (r *I18nProjectRepository) Delete(id uint) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		var releaseIDs []uint
+		if err := tx.Model(&models.LocaleRelease{}).Where("project_id = ?", id).Pluck("id", &releaseIDs).Error; err != nil {
+			return err
+		}
+		if len(releaseIDs) > 0 {
+			if err := tx.Where("release_id IN ?", releaseIDs).Delete(&models.LocaleReleaseFile{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", releaseIDs).Delete(&models.LocaleRelease{}).Error; err != nil {
+				return err
+			}
+		}
 		// Terms reference the project, and translations/history logs reference
 		// those terms. Remove the dependent rows first so this works with the
 		// existing database constraints (which do not all cascade on delete).

@@ -6,6 +6,7 @@ import (
 	"choice-matrix-backend/internal/config"
 	"choice-matrix-backend/internal/repository"
 	"choice-matrix-backend/internal/services"
+	"choice-matrix-backend/internal/sso"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -16,6 +17,7 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB, cfg config.Config) {
 	userRepo := repository.NewUserRepository(db)
 	i18nProjectRepo := repository.NewI18nProjectRepository(db)
 	termRepo := repository.NewTermRepository(db)
+	localeReleaseRepo := repository.NewLocaleReleaseRepository(db)
 	langRepo := repository.NewLanguageRepository(db)
 	availableLangRepo := repository.NewAvailableLanguageRepository(db)
 	aiCredentialRepo := repository.NewAICredentialRepository(db)
@@ -25,6 +27,7 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB, cfg config.Config) {
 	authHandler := handlers.NewAuthHandler(userRepo)
 	i18nProjectHandler := handlers.NewI18nProjectHandler(i18nProjectRepo, termRepo)
 	termHandler := handlers.NewTermHandler(termRepo)
+	localeReleaseHandler := handlers.NewLocaleReleaseHandler(localeReleaseRepo)
 	langHandler := handlers.NewLanguageHandler(langRepo, availableLangRepo)
 	availableLangHandler := handlers.NewAvailableLanguageHandler(availableLangRepo)
 	var aiSettingsHandler *handlers.AISettingsHandler
@@ -37,16 +40,17 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB, cfg config.Config) {
 		api.GET("/ping", func(c *gin.Context) {
 			c.JSON(200, gin.H{"message": "pong"})
 		})
+		api.GET("/public/locales/:projectCode/:languageCode", localeReleaseHandler.PublicFile)
 
 		// Public Routes (Auth)
 		auth := api.Group("/auth")
 		{
-			auth.POST("/login", authHandler.Login)
+			sso.New(db, cfg).Register(auth)
 		}
 
 		// Protected Routes
 		protected := api.Group("/")
-		protected.Use(middleware.AuthMiddleware())
+		protected.Use(sso.New(db, cfg).AuthMiddleware())
 		{
 			protected.GET("/auth/me", authHandler.GetCurrentUser)
 			if aiSettingsHandler != nil {
@@ -75,6 +79,10 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB, cfg config.Config) {
 			// I18n Projects CRUD
 			projects := protected.Group("/projects")
 			{
+				projects.GET("/:id/locale-release", localeReleaseHandler.Latest)
+				projectReleaseAdmin := projects.Group("/:id/locale-release")
+				projectReleaseAdmin.Use(middleware.AdminMiddleware(db))
+				projectReleaseAdmin.POST("/publish", localeReleaseHandler.Publish)
 				projects.GET("", i18nProjectHandler.List)
 				projects.GET("/:id", i18nProjectHandler.Get)
 				projects.GET("/:id/dashboard", i18nProjectHandler.Dashboard)

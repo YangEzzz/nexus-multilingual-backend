@@ -2,6 +2,7 @@ package config
 
 import (
 	"log"
+	"net/url"
 	"os"
 	"strings"
 
@@ -20,6 +21,15 @@ type Config struct {
 	AIRelayBaseURL     string
 	AutoMigrate        bool
 	AllowedOrigins     []string
+	FrontendURL        string
+	CookieSecure       bool
+	HeliosBaseURL      string
+	HeliosInternalURL  string
+	HeliosClientID     string
+	HeliosClientSecret string
+	HeliosRedirectURI  string
+	HeliosProjectID    string
+	HeliosAllowedRoles []string
 }
 
 func LoadConfig() Config {
@@ -40,7 +50,7 @@ func LoadConfig() Config {
 		}
 	}
 
-	return Config{
+	cfg := Config{
 		Port:               getEnv("PORT", "8080"),
 		DBHost:             getEnv("DB_HOST", "localhost"),
 		DBUser:             getEnv("DB_USER", "postgres"),
@@ -52,7 +62,34 @@ func LoadConfig() Config {
 		AIRelayBaseURL:     getEnv("AI_RELAY_BASE_URL", "https://43.172.5.210:3000/v1"),
 		AutoMigrate:        getEnv("AUTO_MIGRATE", "false") == "true",
 		AllowedOrigins:     allowedOrigins,
+		FrontendURL:        getEnv("FRONTEND_URL", "http://localhost:5173"),
+		CookieSecure:       getEnv("COOKIE_SECURE", "true") == "true",
+		HeliosBaseURL:      getEnv("HELIOS_BASE_URL", "http://localhost:5174"),
+		HeliosInternalURL:  getEnv("HELIOS_INTERNAL_URL", "http://127.0.0.1:3456"),
+		HeliosClientID:     getEnv("HELIOS_CLIENT_ID", ""),
+		HeliosClientSecret: getEnv("HELIOS_CLIENT_SECRET", ""),
+		HeliosRedirectURI:  getEnv("HELIOS_REDIRECT_URI", "http://localhost:5173/api/v1/auth/sso/callback"),
+		HeliosProjectID:    getEnv("HELIOS_PROJECT_ID", "nexus-multilingual"),
+		HeliosAllowedRoles: strings.Split(getEnv("HELIOS_ALLOWED_ROLES", "admin,owner,productor,developer,translator"), ","),
 	}
+	for _, raw := range []string{cfg.FrontendURL, cfg.HeliosBaseURL, cfg.HeliosRedirectURI} {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && loopback(u.Hostname()))) {
+			log.Fatal("Browser SSO URLs must use HTTPS, or HTTP on loopback for local development")
+		}
+	}
+	u, _ := url.Parse(cfg.FrontendURL)
+	if !cfg.CookieSecure && !loopback(u.Hostname()) {
+		log.Fatal("COOKIE_SECURE=false is only allowed for loopback development")
+	}
+	for i := range cfg.HeliosAllowedRoles {
+		cfg.HeliosAllowedRoles[i] = strings.TrimSpace(cfg.HeliosAllowedRoles[i])
+	}
+	return cfg
+}
+
+func loopback(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func getEnv(key, fallback string) string {

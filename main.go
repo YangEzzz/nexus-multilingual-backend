@@ -2,6 +2,8 @@ package main
 
 import (
 	"log"
+	"net/http"
+	"strings"
 
 	"choice-matrix-backend/internal/api/routes"
 	"choice-matrix-backend/internal/config"
@@ -19,20 +21,36 @@ func main() {
 	database.ConnectDB(cfg)
 
 	// Set up Gin Server
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery()) // Do not log authorization codes in callback query strings.
 
 	// Configure CORS
 	allowedOrigins := cfg.AllowedOrigins
 	if len(allowedOrigins) == 0 {
-		allowedOrigins = []string{"*"}
+		allowedOrigins = []string{cfg.FrontendURL}
 	}
-	r.Use(cors.New(cors.Config{
+	protectedCORS := cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-CSRF-Token"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
-	}))
+	})
+	r.Use(func(c *gin.Context) {
+		// Published locale files are public assets consumed by other frontends.
+		if strings.HasPrefix(c.Request.URL.Path, "/api/v1/public/locales/") {
+			c.Header("Access-Control-Allow-Origin", "*")
+			c.Header("Access-Control-Allow-Methods", "GET, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Accept, Content-Type")
+			if c.Request.Method == http.MethodOptions {
+				c.AbortWithStatus(http.StatusNoContent)
+				return
+			}
+			c.Next()
+			return
+		}
+		protectedCORS(c)
+	})
 
 	// Register Routes
 	routes.RegisterRoutes(r, database.DB, cfg)

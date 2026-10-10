@@ -26,7 +26,7 @@ func AdminMiddleware(db *gorm.DB) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if user.ID != 1 && user.Role != "admin" && user.Role != "owner" {
+		if user.Role != "admin" && user.Role != "owner" {
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "仅管理员可以管理全局配置"})
 			c.Abort()
 			return

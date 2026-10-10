@@ -1,11 +1,13 @@
 package database
 
 import (
-	"fmt"
 	"log"
+	"net"
+	"net/url"
 
 	"choice-matrix-backend/internal/config"
 	"choice-matrix-backend/internal/models"
+	"choice-matrix-backend/internal/sso"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -14,8 +16,11 @@ import (
 var DB *gorm.DB
 
 func ConnectDB(cfg config.Config) {
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=Asia/Shanghai",
-		cfg.DBHost, cfg.DBUser, cfg.DBPass, cfg.DBName, cfg.DBPort)
+	dbURL := &url.URL{Scheme: "postgres", User: url.UserPassword(cfg.DBUser, cfg.DBPass), Host: net.JoinHostPort(cfg.DBHost, cfg.DBPort), Path: "/" + cfg.DBName}
+	query := dbURL.Query()
+	query.Set("sslmode", "disable")
+	dbURL.RawQuery = query.Encode() + "&timezone=Asia/Shanghai"
+	dsn := dbURL.String()
 
 	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
@@ -44,6 +49,9 @@ func ConnectDB(cfg config.Config) {
 			&models.HistoryLog{},
 			&models.ProjectHistoryLog{},
 			&models.AICredential{},
+			&models.LocaleRelease{},
+			&models.LocaleReleaseFile{},
+			&sso.LoginTransaction{}, &sso.Session{},
 		)
 		if err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
