@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"net/url"
 	"os"
@@ -68,9 +69,15 @@ func LoadConfig() Config {
 		HeliosInternalURL:  getEnv("HELIOS_INTERNAL_URL", "http://127.0.0.1:3456"),
 		HeliosClientID:     getEnv("HELIOS_CLIENT_ID", ""),
 		HeliosClientSecret: getEnv("HELIOS_CLIENT_SECRET", ""),
-		HeliosRedirectURI:  getEnv("HELIOS_REDIRECT_URI", "https://nexus-api.team-tool.top/api/v1/auth/sso/callback"),
+		HeliosRedirectURI:  getEnv("HELIOS_REDIRECT_URI", ""),
 		HeliosProjectID:    getEnv("HELIOS_PROJECT_ID", "nexus-multilingual"),
 		HeliosAllowedRoles: strings.Split(getEnv("HELIOS_ALLOWED_ROLES", "admin,owner,productor,developer,translator"), ","),
+	}
+	// Derive once from trusted deployment configuration. Start and exchange must
+	// use the same URI; request Host / forwarded headers never choose it.
+	cfg.HeliosRedirectURI, err = resolveSSORedirect(cfg.FrontendURL, getEnv("PUBLIC_API_URL", ""), cfg.HeliosRedirectURI)
+	if err != nil {
+		log.Fatal(err)
 	}
 	for _, raw := range []string{cfg.FrontendURL, cfg.HeliosBaseURL, cfg.HeliosRedirectURI} {
 		u, err := url.Parse(raw)
@@ -86,6 +93,24 @@ func LoadConfig() Config {
 		cfg.HeliosAllowedRoles[i] = strings.TrimSpace(cfg.HeliosAllowedRoles[i])
 	}
 	return cfg
+}
+
+func resolveSSORedirect(frontendURL, publicAPIURL, override string) (string, error) {
+	if override != "" {
+		return override, nil // Existing deployments retain their registered callback.
+	}
+	base := frontendURL
+	if publicAPIURL != "" {
+		base = publicAPIURL
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" ||
+		(u.Path != "" && u.Path != "/") ||
+		(u.Scheme != "https" && !(u.Scheme == "http" && loopback(u.Hostname()))) {
+		return "", fmt.Errorf("automatic SSO callback requires a trusted HTTPS origin (HTTP loopback allowed); set PUBLIC_API_URL to the externally accessible API origin")
+	}
+	u.Path = "/api/v1/auth/sso/callback"
+	return u.String(), nil
 }
 
 func loopback(host string) bool {

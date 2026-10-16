@@ -30,7 +30,7 @@ go.work.sum
 .env.example
 
 # Editor/IDE
-# .idea/
+.idea/
 # .vscode/
 
 # Air - Live reload for Go apps

@@ -27,6 +27,9 @@ const SessionCookie = "nexus_session"
 const CSRFCookie = "nexus_csrf"
 const BrowserCookie = "nexus_browser"
 
+const sessionLifetime = 30 * 24 * time.Hour
+const sessionCookieMaxAge = int(sessionLifetime / time.Second)
+
 type LoginTransaction struct {
 	ID          string `gorm:"primaryKey;size:64"`
 	BrowserHash string `gorm:"size:64;not null"`
@@ -130,7 +133,7 @@ func (s *Service) CSRF(c *gin.Context) {
 			fail(c, 500, "无法初始化登录")
 			return
 		}
-		s.cookie(c, CSRFCookie, token, 8*3600, false)
+		s.cookie(c, CSRFCookie, token, sessionCookieMaxAge, false)
 	}
 	success(c, gin.H{"csrf_token": token})
 }
@@ -162,7 +165,7 @@ func (s *Service) Start(c *gin.Context) {
 			fail(c, 500, "无法初始化登录")
 			return
 		}
-		s.cookie(c, BrowserCookie, browser, 8*3600, true)
+		s.cookie(c, BrowserCookie, browser, sessionCookieMaxAge, true)
 	}
 	state, err := random()
 	if err != nil {
@@ -314,7 +317,7 @@ func (s *Service) Callback(c *gin.Context) {
 				return err
 			}
 		}
-		if err = tx.Create(&Session{ID: hash(token), UserID: u.ID, ExternalID: u.ExternalID, VerifiedAt: time.Now(), ExpiresAt: time.Now().Add(8 * time.Hour)}).Error; err != nil {
+		if err = tx.Create(&Session{ID: hash(token), UserID: u.ID, ExternalID: u.ExternalID, VerifiedAt: time.Now(), ExpiresAt: time.Now().Add(sessionLifetime)}).Error; err != nil {
 			return err
 		}
 		result := tx.Model(&LoginTransaction{}).Where("id = ? AND status = ?", t.ID, "processing").Updates(map[string]any{"status": "success", "verifier": ""})
@@ -331,7 +334,7 @@ func (s *Service) Callback(c *gin.Context) {
 		s.complete(c, state)
 		return
 	}
-	s.cookie(c, SessionCookie, token, 8*3600, true)
+	s.cookie(c, SessionCookie, token, sessionCookieMaxAge, true)
 	s.complete(c, state)
 }
 func (s *Service) Status(c *gin.Context) {
