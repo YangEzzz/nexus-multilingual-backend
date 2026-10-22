@@ -40,3 +40,6 @@ build-errors.log
 #
 bin/
 uploads/
+
+# Local runtime logs and artifacts
+.local/

@@ -31,6 +31,7 @@ type termExportRequest struct {
 type termCopyRequest struct {
 	Scope    repository.TermBulkScope `json:"scope" binding:"required"`
 	Language string                   `json:"language" binding:"required"`
+	Format   string                   `json:"format"`
 }
 
 func NewTermHandler(repo *repository.TermRepository) *TermHandler {
@@ -535,6 +536,10 @@ func (h *TermHandler) CopyTermsJSON(c *gin.Context) {
 		}
 		return
 	}
+	if req.Format != "" && req.Format != "json" && req.Format != "pairs" {
+		c.JSON(http.StatusOK, gin.H{"code": 400, "message": "不支持的复制格式"})
+		return
+	}
 	languages, err := h.repo.ProjectLanguages(uint(projectID))
 	if err != nil {
 		log.Printf("copy languages failed for project %d: %v", projectID, err)
@@ -556,7 +561,17 @@ func (h *TermHandler) CopyTermsJSON(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"code": 413, "message": "复制最多支持 1000 条，请改用 JSON 导出"})
 		return
 	}
-	content, err := utils.BuildLanguageJSON(terms, req.Language)
+	var content []byte
+	count, skipped := len(terms), 0
+	if req.Format == "pairs" {
+		content, count, skipped, err = utils.BuildLanguagePairs(terms, req.Language)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"code": 400, "message": err.Error()})
+			return
+		}
+	} else {
+		content, err = utils.BuildLanguageJSON(terms, req.Language)
+	}
 	if err != nil {
 		log.Printf("copy JSON generation failed for project %d: %v", projectID, err)
 		c.JSON(http.StatusOK, gin.H{"code": 500, "message": "生成复制内容失败"})
@@ -568,7 +583,8 @@ func (h *TermHandler) CopyTermsJSON(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "复制内容已生成", "data": gin.H{
 		"content": string(content),
-		"count":   len(terms),
+		"count":   count,
+		"skipped": skipped,
 	}})
 }
 

@@ -39,6 +39,39 @@ func BuildLanguageJSON(terms []models.Term, languageCode string) ([]byte, error)
 	return json.MarshalIndent(root, "", "  ")
 }
 
+// BuildLanguagePairs returns JSON object members for pasting into an existing
+// language file. Modules are intentionally omitted; ambiguous keys are rejected.
+func BuildLanguagePairs(terms []models.Term, languageCode string) ([]byte, int, int, error) {
+	values := make(map[string]string)
+	seen := make(map[string]bool)
+	skipped := 0
+	for _, term := range terms {
+		if seen[term.Key] {
+			return nil, 0, 0, fmt.Errorf("选中词条存在重复 Key %q，请按模块筛选后再复制", term.Key)
+		}
+		seen[term.Key] = true
+		value := termTranslations(term)[languageCode]
+		if strings.TrimSpace(value) == "" {
+			skipped++
+			continue
+		}
+		values[term.Key] = value
+	}
+	if len(values) == 0 {
+		return []byte{}, 0, skipped, nil
+	}
+	content, err := json.MarshalIndent(values, "", "  ")
+	if err != nil {
+		return nil, 0, skipped, err
+	}
+	lines := strings.Split(string(content), "\n")
+	lines = lines[1 : len(lines)-1]
+	for i := range lines {
+		lines[i] = strings.TrimPrefix(lines[i], "  ")
+	}
+	return []byte(strings.Join(lines, "\n")), len(values), skipped, nil
+}
+
 func writeZipFile(writer *zip.Writer, name string, content []byte) error {
 	entry, err := writer.Create(name)
 	if err != nil {

@@ -35,6 +35,33 @@ func TestBuildLanguageJSON(t *testing.T) {
 	}
 }
 
+func TestBuildLanguagePairs(t *testing.T) {
+	terms := []models.Term{
+		{Key: "auth.title", Module: "auth", Translations: []models.Translation{{LanguageCode: "en", Content: "Say \"hello\"\n{user}"}}},
+		{Key: "__proto__", Translations: []models.Translation{{LanguageCode: "en", Content: "literal key"}}},
+		{Key: "missing"},
+		{Key: "blank", Translations: []models.Translation{{LanguageCode: "en", Content: "  "}}},
+	}
+	content, count, skipped, err := BuildLanguagePairs(terms, "en")
+	if err != nil || count != 2 || skipped != 2 {
+		t.Fatalf("unexpected result: count=%d skipped=%d err=%v", count, skipped, err)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(append(append([]byte("{"), content...), '}'), &payload); err != nil {
+		t.Fatalf("fragment cannot be pasted into an object: %v", err)
+	}
+	if payload["auth.title"] != "Say \"hello\"\n{user}" || payload["__proto__"] != "literal key" || len(payload) != 2 {
+		t.Fatalf("keys or values changed: %#v", payload)
+	}
+	if _, _, _, err := BuildLanguagePairs([]models.Term{{Key: "same", Module: "a"}, {Key: "same", Module: "b"}}, "en"); err == nil {
+		t.Fatal("duplicate keys must not overwrite each other")
+	}
+	content, count, skipped, err = BuildLanguagePairs(terms[2:], "en")
+	if err != nil || len(content) != 0 || count != 0 || skipped != 2 {
+		t.Fatalf("unexpected empty result: %q %d %d %v", content, count, skipped, err)
+	}
+}
+
 func TestBuildLanguageJSONArchive(t *testing.T) {
 	content, err := BuildLanguageJSONArchive(exportTestTerms(), []string{"cn", "en"})
 	if err != nil {
